@@ -20,6 +20,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Create
 import androidx.compose.material.icons.filled.Search
@@ -62,6 +63,7 @@ fun ChatsDrawer(
     onFree: () -> Unit = {},
     onClaudeCode: () -> Unit = {},
     onMovieMaker: () -> Unit = {},
+    onSecurityLab: () -> Unit = {},
     onProject: (com.arin.data.Project) -> Unit,
 ) {
     var renaming by remember { mutableStateOf<ChatSummary?>(null) }
@@ -156,6 +158,7 @@ fun ChatsDrawer(
             DrawerRow(icon = { Icon(Icons.Filled.Star, contentDescription = null) }, label = "Free tokens", onClick = onFree)
             DrawerRow(icon = { Icon(Icons.Filled.Build, contentDescription = null) }, label = "Claude Code (your Pro login)", onClick = onClaudeCode)
             DrawerRow(icon = { Icon(Icons.Filled.PlayArrow, contentDescription = null) }, label = "Movie Maker", onClick = onMovieMaker)
+            DrawerRow(icon = { Icon(Icons.Filled.Lock, contentDescription = null) }, label = "Security Lab", onClick = onSecurityLab)
             DrawerRow(icon = { Icon(Icons.Filled.Build, contentDescription = null) }, label = "Build an app (APK)", onClick = onBuild)
             DrawerRow(
                 icon = { Icon(Icons.Filled.Build, contentDescription = null) },

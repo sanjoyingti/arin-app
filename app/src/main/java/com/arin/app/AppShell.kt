@@ -15,7 +15,7 @@ import com.arin.project.ProjectsScreen
 import com.arin.settings.SettingsScreen
 
 /** Every top-level screen. Chat is home. */
-enum class Screen { Chat, Settings, Projects, Project, Build, Logs, FreeTokens, ClaudeCode, MovieMaker, REA, Hack }
+enum class Screen { Chat, Settings, Projects, Project, Build, Logs, FreeTokens, ClaudeCode, MovieMaker, SecLab, REA, Hack }
 
 /** Owns which screen is showing. Screens never navigate themselves; they call back here. */
 @Composable
@@ -70,6 +70,7 @@ fun AppShell(vm: ChatViewModel) {
             onOpenFree = { screen = Screen.FreeTokens },
             onOpenClaudeCode = { screen = Screen.ClaudeCode },
             onOpenMovieMaker = { screen = Screen.MovieMaker },
+            onOpenSecurityLab = { screen = Screen.SecLab },
             startVoice = Launch.voicePending,
             onVoiceStarted = { Launch.voicePending = false },
         )
@@ -87,6 +88,7 @@ fun AppShell(vm: ChatViewModel) {
             onOpenSettings = { settingsFromClaudeCode = true; screen = Screen.Settings },
         )
         Screen.MovieMaker -> com.arin.movie.MovieMakerScreen(vm, onBack = { screen = Screen.Chat })
+        Screen.SecLab -> com.arin.sec.SecurityLabScreen(vm, onBack = { screen = Screen.Chat })
         Screen.REA -> com.arin.rea.ReaWorkbenchScreen(
             vm = vm,
             onBack = { screen = Screen.Settings },
