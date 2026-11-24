@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Only exported chats and built APKs are shared with other apps. -->
+<paths>
+    <cache-path name="exports" path="exports/" />
+    <!-- APKs built in Build mode, opened with Android's installer. -->
+    <cache-path name="apks" path="apks/" />
+    <!-- Movies made in the Movie Maker, opened or shared. -->
+    <cache-path name="movies" path="movies/" />
+</paths>
