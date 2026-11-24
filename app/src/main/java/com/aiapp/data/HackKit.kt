@@ -2,8 +2,10 @@ package com.aiapp.data
 
 import android.content.Context
 import com.arin.terminal.Linux
+import com.arin.terminal.Termux
 import java.io.File
 import java.util.regex.Pattern
+import kotlinx.coroutines.runBlocking
 
 /**
  * Tools and analysis for the Hack Suite. Jar tools live in the app's storage (and are mirrored
@@ -44,8 +46,14 @@ object HackToolsShim {
         }.getOrNull()
     }
 
-    private fun runLinux(ctx: Context, cmd: String, timeoutMs: Long, log: ((String) -> Unit)? = null): Linux.Result? =
-        runCatching { Linux.run(ctx, cmd, timeoutMs = timeoutMs, onOutput = { line -> log?.invoke(line) }) }.getOrNull()
+    /**
+     * Runs [cmd] inside the built-in Linux and returns the result (or null on failure). The terminal
+     * helper suspends, so the call is wrapped here and the caller can stay a plain function.
+     */
+    private fun runLinux(ctx: Context, cmd: String, timeoutMs: Long, log: ((String) -> Unit)? = null): Termux.Result? =
+        runBlocking {
+            runCatching { Linux.run(ctx, cmd, timeoutMs = timeoutMs, onOutput = { line -> log?.invoke(line) }) }.getOrNull()
+        }
 
     /** Verifies a jar runs by passing it --version inside Linux; returns the printed version or null. */
     private fun jarVersion(ctx: Context, jar: File): String? {
@@ -81,8 +89,9 @@ object HackToolsShim {
             log("Installing Python tools in the built-in Linux: pip install objection frida-tools …")
             runLinux(ctx, """bash -c "pip install objection frida-tools"""", timeoutMs = 10 * 60_000L, log = log)
             val check = runLinux(ctx, """bash -c "objection version 2>/dev/null | head -1; frida --version 2>/dev/null"""", timeoutMs = 120_000L)
+            val verified = check?.stdout?.isNotBlank() == true
             log(
-                if (check != null && check.stdout.isNotBlank()) "Verified: ${check.stdout.trim().replace('\n', " · ")}"
+                if (verified && check != null) "Verified: ${check.stdout.trim().replace("\n", " · ")}"
                 else "Python tools install attempted (they'll be verified the first time a hook runs).",
             )
         } else {
@@ -104,7 +113,7 @@ object HackToolsShim {
 
         val pkg = Regex("""package:\s*name='([^']*)'[^']*versionCode='([^']*)'\s*versionName='([^']*)'""").find(badging)
         val appName = Regex("""application-label:'([^']*)'""").find(badging)?.groupValues?.get(1)
-        out["Identity"] = buildString {
+	out["Identity"] = buildString {
             appendLine("Package: ${pkg?.groupValues?.get(1) ?: "?"}")
             appendLine("App name: ${appName ?: "?"}")
             appendLine("Version: ${pkg?.groupValues?.get(3) ?: "?"} (code ${pkg?.groupValues?.get(2) ?: "?"})")
