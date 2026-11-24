@@ -14,7 +14,7 @@ object HashId {
         when {
             t.startsWith("$2a$") || t.startsWith("$2b$") || t.startsWith("$2y$") ->
                 out += Match("bcrypt", "{0}", "hashcat -m 3200, john --format=bcrypt")
-            t.startsWith("$argon2") -> out += Match("Argon2", "argon2", "hashcat -m 3500 / john argon2")
+            t.startsWith("\$argon2") -> out += Match("Argon2", "argon2", "hashcat -m 3500 / john argon2")
             t.startsWith("$6$") -> out += Match("SHA-512 crypt", "{6}", "hashcat -m 1800, john sha512crypt")
             t.startsWith("$5$") -> out += Match("SHA-256 crypt", "{5}", "hashcat -m 7400")
             t.startsWith("$1$") -> out += Match("MD5 crypt (unix)", "{1}", "hashcat -m 500, john md5crypt")

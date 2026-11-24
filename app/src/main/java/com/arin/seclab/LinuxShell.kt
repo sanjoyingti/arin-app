@@ -2,6 +2,7 @@ package com.arin.seclab
 
 import android.content.Context
 import com.arin.terminal.Linux
+import com.arin.terminal.Termux
 import java.io.File
 
 /** Thin wrapper over the built-in Linux: everything the Security Lab runs goes through here. */
@@ -37,7 +38,7 @@ object LinuxShell {
         command: String,
         timeoutMs: Long = 10 * 60_000L,
         onLine: (String) -> Unit = {},
-    ): Linux.Result? = runCatching {
+    ): Termux.Result? = runCatching {
         Linux.run(context, "bash -c " + quote(command), timeoutMs = timeoutMs, onOutput = onLine)
     }.getOrNull()
 

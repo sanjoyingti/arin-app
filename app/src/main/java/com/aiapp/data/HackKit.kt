@@ -236,7 +236,7 @@ Java.perform(function () {
             getAcceptedIssuers: function () { return []; }
         }
     });
-    var trustAll = [TrustAll.$new()];
+    var trustAll = [TrustAll.${'$'}new()];
     var SSLContext = Java.use('javax.net.ssl.SSLContext');
     SSLContext.init.overload('[Ljavax.net.ssl.KeyManager;', '[Ljavax.net.ssl.TrustManager;', '[Ljava.security.SecureRandom;')
         .implementation = function (km, tm, sr) {
@@ -271,7 +271,7 @@ Java.perform(function () {
     Runtime.exec.overload('java.lang.String').implementation = function (cmd) {
         if (cmd === 'su' || cmd.indexOf('su ') !== -1 || cmd.indexOf('which') !== -1) {
             console.log('[*] Blocked exec: ' + cmd);
-            throw Java.use('java.io.IOException').$new('blocked by root_bypass');
+            throw Java.use('java.io.IOException').${'$'}new('blocked by root_bypass');
         }
         return this.exec(cmd);
     };
