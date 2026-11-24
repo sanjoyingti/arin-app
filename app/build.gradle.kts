@@ -15,8 +15,8 @@ android {
         // 28, like Termux: Android blocks running programs from app storage for apps targeting 29+,
         // and the built-in Linux (PRoot) needs that. Arin is installed from GitHub, not the Play Store.
         targetSdk = 28
-        versionCode = 177
-        versionName = "1.1.0"
+        versionCode = 20
+        versionName = "0.15.0"
     }
 
     signingConfigs {
@@ -74,6 +74,8 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+    // On-device AI runtime. Pinned: 0.20.x ships class-file v69 unsupported by the current dexer.
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.19.1")
     // Reads the text of PDFs, so big PDFs and models without PDF support still work.
     implementation("com.tom-roush:pdfbox-android:2.0.27.0")
     // Unpacks the Ubuntu image for the built-in Linux.
