@@ -15,7 +15,7 @@ import com.arin.project.ProjectsScreen
 import com.arin.settings.SettingsScreen
 
 /** Every top-level screen. Chat is home. */
-enum class Screen { Chat, Settings, Projects, Project, Build, Logs, FreeTokens, ClaudeCode, MovieMaker, REA }
+enum class Screen { Chat, Settings, Projects, Project, Build, Logs, FreeTokens, ClaudeCode, MovieMaker, REA, Hack }
 
 /** Owns which screen is showing. Screens never navigate themselves; they call back here. */
 @Composable
@@ -29,6 +29,7 @@ fun AppShell(vm: ChatViewModel) {
         screen = when {
             screen == Screen.Project && backToProjects -> Screen.Projects
             screen == Screen.Settings && settingsFromClaudeCode -> Screen.ClaudeCode
+            screen == Screen.Hack -> Screen.Chat
             else -> Screen.Chat
         }
         if (screen != Screen.Settings) settingsFromClaudeCode = false
@@ -97,6 +98,7 @@ fun AppShell(vm: ChatViewModel) {
             onBack = { screen = Screen.Chat },
             onOpenSettings = { screen = Screen.Settings },
         )
+        Screen.Hack -> com.aiapp.ui.HackSuiteScreen(onBack = { screen = Screen.Chat })
         Screen.Projects -> ProjectsScreen(
             vm,
             onBack = { screen = Screen.Chat },

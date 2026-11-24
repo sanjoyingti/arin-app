@@ -1,377 +1,334 @@
 package com.aiapp.data
 
 import android.content.Context
+import com.arin.terminal.Linux
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
 import java.util.regex.Pattern
 
 /**
- * Hack Suite engine. Installs the command-line reversing tools once (apktool, uber-apk-signer,
- * Objection + Frida tools via pip inside Arin's built-in Linux), analyses an APK (identity,
- * permissions, components, embedded secrets, security checklist) and holds the bundled Frida hook
- * scripts. Everything is idempotent: already-installed tools are skipped.
+ * Tools and analysis for the Hack Suite. Jar tools live in the app's storage (and are mirrored
+ * into the built-in Linux), Python tools are pip-installed inside the built-in Linux (PRoot), and
+ * the chosen APK is analysed with aapt2 plus a plain-text scan. Everything is idempotent.
  */
 object HackToolsShim {
-
-    /** Logged lines shown in the Hack Suite screen. */
-    @Volatile
-    var log: (String) -> Unit = {}
 
     private fun toolsDir(ctx: Context) = File(ctx.filesDir, "hacktools").apply { mkdirs() }
     fun apktoolJar(ctx: Context) = File(toolsDir(ctx), "apktool.jar")
     fun signerJar(ctx: Context) = File(toolsDir(ctx), "uber-apk-signer.jar")
-    private fun workDir(ctx: Context) = File(ctx.cacheDir, "hack").apply { mkdirs() }
 
-    private fun run(cmd: List<String>, timeoutSec: Long = 300): Pair<Int, String> {
-        return try {
-            val p = ProcessBuilder(cmd).redirectErrorStream(true).start()
-            val out = StringBuilder()
-            val reader = p.inputStream.bufferedReader()
-            val deadline = System.currentTimeMillis() + timeoutSec * 1000
-            val buf = CharArray(2048)
-            while (true) {
-                if (!reader.ready()) {
-                    if (p.waitFor(1, java.util.concurrent.TimeUnit.SECONDS)) break
-                    if (System.currentTimeMillis() > deadline) { p.destroyForcibly(); break }
-                    continue
-                }
-                val n = reader.read(buf)
-                if (n < 0) break
-                out.appendRange(buf, 0, n)
-            }
-            reader.close()
-            p.waitFor().also { out.append(reader.readText()) } to out.toString()
-        } catch (e: Exception) {
-            -1 to e.message.orEmpty()
-        }
-    }
+    private const val APKTOOL_URL = "https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.10.0.jar"
+    private const val SIGNER_URL = "https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar"
 
-    private fun fetch(url: String, out: File): Boolean = runCatching {
-        val conn = URL(url).openConnection() as HttpURLConnection
-        conn.connectTimeout = 15000
-        conn.readTimeout = 60000
+    /** Fetches [url] into [dest]; true when a non-trivial file landed. */
+    private fun download(url: String, dest: File): Boolean = runCatching {
+        val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+        conn.connectTimeout = 20_000
+        conn.readTimeout = 120_000
         conn.instanceFollowRedirects = true
-        if (conn.responseCode !in 200..299) return false
-        conn.inputStream.use { i -> out.outputStream().use { i.copyTo(it, 1 shl 16) } }
-        out.length() > 1000
+        conn.inputStream.use { input -> dest.outputStream().use { input.copyTo(it, 1 shl 16) } }
+        dest.length() > 10_000
     }.getOrDefault(false)
 
-    private fun latestGithubJar(repo: String): String? = runCatching {
-        val conn = URL("https://api.github.com/repos/$repo/releases/latest").openConnection() as HttpURLConnection
-        conn.setRequestProperty("Accept", "application/vnd.github+json")
-        val body = conn.inputStream.bufferedReader().use { it.readText() }
-        Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]+\\.jar)\"").findAll(body)
-            .map { it.groupValues[1] }.firstOrNull { it.contains("uber-apk-signer") || !it.contains("sources") }
-    }.getOrNull()
+    /** The mirror of the tools inside the Linux filesystem, so java/pip inside Linux can use them. */
+    private fun exposedDir(ctx: Context) = File(File(Linux.rootfs(ctx), "root"), ".arin-hacktools").apply { mkdirs() }
 
-    private fun latestApktoolUrl(): String = runCatching {
-        val conn = URL("https://bitbucket.org/iBotPeaches/apktool/downloads/?tab=tags").openConnection() as HttpURLConnection
-        val body = conn.inputStream.bufferedReader().use { it.readText() }
-        Regex("href=\"(/iBotPeaches/apktool/downloads/[^\"]+\\.jar)\"").findAll(body)
-            .map { "https://bitbucket.org" + it.groupValues[1] }.firstOrNull()
-    }.getOrNull() ?: "https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar"
-
-    /**
-     * Installs everything that isn't installed yet, verifying each tool with --version afterwards.
-     * Safe to call repeatedly.
-     */
-    fun ensureTools(ctx: Context) {
-        log("Ensuring hack tools are installed…")
-        val apktool = apktoolJar(ctx)
-        if (apktool.exists() && apktool.length() > 100_000) {
-            log("✔ apktool.jar already present")
-        } else {
-            log("Downloading latest apktool from Bitbucket…")
-            if (fetch(latestApktoolUrl(), apktool) && run(listOf("java", "-jar", apktool.absolutePath, "--version")).first == 0) {
-                log("✔ apktool ${apktool.length() / 1024} KB installed")
-            } else { apktool.delete(); log("✖ apktool download/install failed") }
-        }
-
-        val signer = signerJar(ctx)
-        if (signer.exists() && signer.length() > 100_000) {
-            log("✔ uber-apk-signer already present")
-        } else {
-            log("Downloading uber-apk-signer from GitHub…")
-            val url = latestGithubJar("patrickfav/uber-apk-signer") ?: "https://github.com/patrickfav/uber-apk-signer/releases/latest"
-            if (fetch(url, signer) && run(listOf("java", "-jar", signer.absolutePath, "--version")).first == 0) {
-                log("✔ uber-apk-signer installed")
-            } else { signer.delete(); log("✖ uber-apk-signer download/install failed") }
-        }
-
-        log("Installing Objection + Frida tools via pip (this can take a few minutes)…")
-        val (code, out) = run(listOf("bash", "-c", "pip install objection frida-tools"), timeoutSec = 900)
-        if (code == 0 || out.contains("already satisfied")) {
-            val fv = run(listOf("frida", "--version")).second.trim().lineSequence().firstOrNull()
-            log("✔ Objection + Frida installed${fv?.let { " (Frida $it)" }.orEmpty()}")
-        } else {
-            log("✖ pip install failed: ${out.lineSequence().lastOrNull()?.take(200).orEmpty()}")
-        }
-        log("Hack tools ready.")
-    }
-
-    /** True when aapt2 is on PATH (it comes with the Android build tools). */
-    private fun aapt2Available(): Boolean = run(listOf("aapt2", "--version"), timeoutSec = 15).first == 0
-
-    /**
-     * Full recon of [apkPath]. Keys: package, app_name, version, permissions, activities, services,
-     * secrets, vulnerabilities. Values are human-readable multi-line text.
-     */
-    fun analyze(apkPath: String): Map<String, String> {
-        val results = LinkedHashMap<String, String>()
+    /** Copies the APK into the Linux filesystem at a fixed path; returns that path or null. */
+    private fun stageApk(ctx: Context, apkPath: String): String? {
         val apk = File(apkPath)
-        if (!apk.exists()) { results["error"] = "APK not found: $apkPath"; return results }
-
-        // --- Identity + permissions via aapt2 dump badging ---
-        val badging = run(listOf("aapt2", "dump", "badging", apk.absolutePath)).second
-        if (badging.isNotBlank() && !aapt2Available().let { false } || badging.contains("package:")) {
-            Regex("""package:\s+name='([^']+)'""").find(badging)?.let { results["package"] = it.groupValues[1] }
-            Regex("""application-label:'([^']*)'""").find(badging)?.let { results["app_name"] = it.groupValues[1] }
-            Regex("""versionName='([^']*)'""").find(badging)?.let { results["version"] = it.groupValues[1] }
-            results["permissions"] = """uses-permission:[^\s]+=?\s*'?([^'\s]+)'?""".toRegex()
-                .findAll(badging).map { it.groupValues[1] }.distinct().joinToString("\n")
-            results["activities"] = """launchable-activity:[^\s]*name='([^']+)'""".toRegex()
-                .findAll(badging).map { it.groupValues[1] }.distinct().joinToString("\n")
-        }
-
-        // --- Decode for the deeper scans (manifest attrs, embedded secrets) ---
-        val outDir = File(workDir(System.getProperty("user.dir") ?: "."), "decoded_" + apk.nameWithoutExtension)
-        outDir.deleteRecursively()
-        val manifestTxt: String?
-        if (apktoolJar(File("/data/data/com.arin.app/files")).exists() || run(listOf("which", "apktool")).first == 0) {
-            val dec = run(listOf("bash", "-c", "apktool d -f -o '${outDir.absolutePath}' '${apk.absolutePath}' >/dev/null 2>&1"))
-            manifestTxt = File(outDir, "AndroidManifest.xml").takeIf { it.exists() }?.readText()
-        } else {
-            manifestTxt = null
-        }
-
-        if (manifestTxt != null) {
-            if (!results.containsKey("package")) {
-                Regex("""package="([^"]+)"""").find(manifestTxt)?.let { results["package"] = it.groupValues[1] }
-            }
-            Regex("""<activity\b[^>]*android:name="([^"]+)"""").findAll(manifestTxt)
-                .map { it.groupValues[1] }.distinct().joinToString("\n")
-                .takeIf { it.isNotBlank() }?.let { results["activities"] = it }
-            Regex("""<service\b[^>]*android:name="([^"]+)"""").findAll(manifestTxt)
-                .map { it.groupValues[1] }.distinct().joinToString("\n")
-                .takeIf { it.isNotBlank() }?.let { results["services"] = it }
-            results["vulnerabilities"] = vulnChecklist(manifestTxt)
-            results["secrets"] = secretScan(outDir)
-            log("✔ Analysis complete")
-        } else if (badging.isNotBlank()) {
-            results["note"] = "Deep scan unavailable (apktool failed); identity and permissions above come from aapt2."
-        } else {
-            results["error"] = "Couldn't analyse the APK (aapt2 and apktool both unavailable)."
-        }
-        return results
+        if (!apk.exists()) return null
+        return runCatching {
+            val dest = File(File(Linux.rootfs(ctx), "root/files"), "hack-target.apk")
+            dest.parentFile?.mkdirs()
+            apk.copyTo(dest, overwrite = true)
+            "/root/files/hack-target.apk"
+        }.getOrNull()
     }
 
-    private fun vulnChecklist(manifest: String): String {
-        val findings = mutableListOf<String>()
-        if (Regex("""android:debuggable="true"""").containsMatchIn(manifest)) findings += "• DEBUGGABLE build: on by default, exposes internals to any USB debugger."
-        if (!Regex("""android:allowBackup="false"""").containsMatchIn(manifest)) findings += "• allowBackup is ON (default): private data is copied by adb backup/cloud backups."
-        if (!Regex("""android:usesCleartextTraffic="false"""").containsMatchIn(manifest)) findings += "• Cleartext HTTP traffic not explicitly disabled: network calls may be intercepted."
-        Regex("""<(activity|service|receiver|provider)\b[^>]*>\s*""", Pattern.DOTALL)
-        val exported = Regex("""<(activity|service|receiver|provider)\b[^>]*android:exported="true"[^>]*>""", Pattern.DOTALL)
-            .findAll(manifest).count { true }
-        if (exported > 0) findings += "• $exported exported component(s): reachable by other apps — check intent filters."
-        if (Regex("""<activity\b[^>]*javascript="true"""").containsMatchIn(manifest) || manifest.contains("JavascriptInterface")) {
-            findings += "• WebView JavaScript bridge/interface detected: check addJavascriptInterface exposure."
-        }
-        if (findings.isEmpty()) findings += "None — clean configuration checklist."
-        return findings.joinToString("\n")
+    private fun runLinux(ctx: Context, cmd: String, timeoutMs: Long, log: ((String) -> Unit)? = null): Linux.Result? =
+        runCatching { Linux.run(ctx, cmd, timeoutMs = timeoutMs, onOutput = { line -> log?.invoke(line) }) }.getOrNull()
+
+    /** Verifies a jar runs by passing it --version inside Linux; returns the printed version or null. */
+    private fun jarVersion(ctx: Context, jar: File): String? {
+        val exposed = File(exposedDir(ctx), jar.name)
+        runCatching { jar.copyTo(exposed, overwrite = true) }
+        if (!exposed.exists()) return null
+        val r = runLinux(ctx, "java -jar /root/.arin-hacktools/${jar.name} --version", timeoutMs = 120_000L)
+        return r?.stdout?.trim()?.lineSequence()?.firstOrNull { it.isNotBlank() }
     }
 
-    private val SECRET_PATTERNS = listOf(
-        "Google API key" to Regex("""AIza[0-9A-Za-z\-_]{35}"""),
-        "Firebase database URL" to Regex("""https://[a-zA-Z0-9\-]+\.firebaseio\.com"""),
-        "Firebase config" to Regex("""1://[0-9]{6,}:[a-z0-9]+:[a-zA-Z0-9\-_]+"""),
-        "JWT token" to Regex("""eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"""),
-        "Bearer/API token" to Regex("""(?i)(token|secret|apikey|api_key|access_key)["']?\s*[:=]\s*["'][A-Za-z0-9\-_.]{16,}["']"""),
-        "AWS key" to Regex("""AKIA[0-9A-Z]{16}"""),
-        "Private key block" to Regex("""-----BEGIN PRIVATE KEY-----"""),
-    )
+    /**
+     * Ensures apktool.jar, uber-apk-signer.jar (downloaded) and objection + frida-tools (pip inside
+     * the built-in Linux) are present, verifying each with --version. Safe to call repeatedly.
+     */
+    fun ensureTools(ctx: Context, log: (String) -> Unit) {
+        exposedDir(ctx)
 
-    private fun secretScan(decodedDir: File): String {
-        val found = LinkedHashMap<String, MutableSet<String>>()
-        decodedDir.walkTopDown()
-            .filter { it.isFile && (it.parentFile?.name == "strings" || it.parentFile?.parentFile?.name == "values" || it.extension !in setOf("arsc", "dex")) }
-            .take(4000).forEach { f ->
-                val text = runCatching { f.readText() }.getOrNull() ?: return@forEach
-                for ((label, rx) in SECRET_PATTERNS) {
-                    rx.findAll(text).forEach { m -> found.getOrPut(label) { LinkedHashSet() }.add(m.value.take(80)) }
+        if (!apktoolJar(ctx).exists()) {
+            log("Downloading apktool (Bitbucket, latest release)…")
+            val ok = download(APKTOOL_URL, apktoolJar(ctx))
+            log(if (ok) "apktool downloaded." else "apktool download failed — decompilation will be limited.")
+        } else log("apktool: already installed.")
+        jarVersion(ctx, apktoolJar(ctx))?.let { log("apktool --version → $it") }
+
+        if (!signerJar(ctx).exists()) {
+            log("Downloading uber-apk-signer (GitHub patrickfav release)…")
+            val ok = download(SIGNER_URL, signerJar(ctx))
+            log(if (ok) "uber-apk-signer downloaded." else "uber-apk-signer download failed — signing unavailable.")
+        } else log("uber-apk-signer: already installed.")
+        jarVersion(ctx, signerJar(ctx))?.let { log("uber-apk-signer --version → $it") }
+
+        if (Linux.installed(ctx)) {
+            log("Installing Python tools in the built-in Linux: pip install objection frida-tools …")
+            runLinux(ctx, """bash -c "pip install objection frida-tools"""", timeoutMs = 10 * 60_000L, log = log)
+            val check = runLinux(ctx, """bash -c "objection version 2>/dev/null | head -1; frida --version 2>/dev/null"""", timeoutMs = 120_000L)
+            log(
+                if (check != null && check.stdout.isNotBlank()) "Verified: ${check.stdout.trim().replace('\n', " · ")}"
+                else "Python tools install attempted (they'll be verified the first time a hook runs).",
+            )
+        } else {
+            log("Built-in Linux isn't installed — objection/frida-tools skipped.")
+        }
+    }
+
+    /**
+     * Analyses the APK at [apkPath]. Sections: Identity, Permissions, Activities, Services,
+     * Embedded secrets, Vulnerability checklist.
+     */
+    fun analyze(ctx: Context, apkPath: String, log: (String) -> Unit): Map<String, String> {
+        val out = linkedMapOf<String, String>()
+        val linuxApk = stageApk(ctx, apkPath)
+        val badging = linuxApk?.let {
+            runLinux(ctx, "aapt2 dump badging $it", timeoutMs = 3 * 60_000L)?.stdout.orEmpty()
+        }.orEmpty()
+        if (badging.isBlank()) log("aapt2 gave no output (is the built-in Linux with Android tools installed?).")
+
+        val pkg = Regex("""package:\s*name='([^']*)'[^']*versionCode='([^']*)'\s*versionName='([^']*)'""").find(badging)
+        val appName = Regex("""application-label:'([^']*)'""").find(badging)?.groupValues?.get(1)
+        out["Identity"] = buildString {
+            appendLine("Package: ${pkg?.groupValues?.get(1) ?: "?"}")
+            appendLine("App name: ${appName ?: "?"}")
+            appendLine("Version: ${pkg?.groupValues?.get(3) ?: "?"} (code ${pkg?.groupValues?.get(2) ?: "?"})")
+        }.trim()
+
+        out["Permissions"] = Regex("""uses-permission:'([^']*)'""").findAll(badging)
+            .map { it.groupValues[1] }.distinct().joinToString("\n").ifBlank { "(none declared)" }
+
+        val manifestRaw = manifestRawStrings(apkPath)
+        out["Activities"] = (
+            Regex("""launchable-activity:\s*name='([^']*)'""").findAll(badging).map { it.groupValues[1] } +
+                componentNames(manifestRaw, "activity")
+            ).distinct().joinToString("\n").ifBlank { "(none found)" }
+        out["Services"] = componentNames(manifestRaw, "service").ifBlank { "(none found — decompile with apktool for details)" }
+
+        out["Embedded secrets"] = scanSecrets(apkPath, log)
+        out["Vulnerability checklist"] = vulnChecklist(badging, manifestRaw)
+        return out
+    }
+
+    /** Pulls the compressed XML string pool of AndroidManifest.xml as a latin-1 soup of names. */
+    private fun manifestRawStrings(apkPath: String): String = runCatching {
+        val z = java.util.zip.ZipFile(File(apkPath))
+        val entry = z.getEntry("AndroidManifest.xml") ?: return ""
+        z.getInputStream(entry).use { it.readBytes().toString(Charsets.ISO_8859_1) }
+    }.getOrDefault("")
+
+    /** Finds name='…' attributes belonging to components of [kind] in the raw manifest soup. */
+    private fun componentNames(manifestRaw: String, kind: String): String =
+        Regex("""<(?:$kind)[^>]*?(?:android[\s\x00-\x20]*)?name=['\x00][^'\x00]*['\x00]""").findAll(manifestRaw)
+            .map { it.value.substringAfter('=').trim('\'', '\u0000', ' ', '"') }
+            .filter { it.isNotBlank() && it.contains('.') }
+            .distinct().joinToString("\n")
+
+    /** Scans XML/text entries of the APK for secret-looking strings. */
+    private fun scanSecrets(apkPath: String, log: (String) -> Unit): String {
+        val findings = linkedMapOf<String, MutableSet<String>>()
+        fun add(kind: String, v: String) = findings.getOrPut(kind) { linkedSetOf() }.add(v)
+        runCatching {
+            java.util.zip.ZipFile(File(apkPath)).use { z ->
+                for (e in z.entries()) {
+                    val name = e.name
+                    val looksText = name.endsWith(".xml") || name.startsWith("res/") || name.startsWith("assets/") ||
+                        name.endsWith(".json") || name.endsWith(".properties") || name.endsWith(".txt")
+                    if (!looksText || e.size > 4L * 1024 * 1024) continue
+                    val text = runCatching { z.getInputStream(e).use { it.readBytes().toString(Charsets.UTF_8) } }.getOrNull() ?: continue
+                    SECRET_PATTERNS.forEach { (kind, rx) -> rx.matcher(text).let { m -> while (m.find()) add(kind, m.group().take(140)) } }
                 }
             }
-        if (found.isEmpty()) return "No embedded secrets matched the known patterns."
-        return found.entries.joinToString("\n\n") { (label, vals) ->
-            "$label:\n" + vals.take(8).joinToString("\n") { "  • $it" } + if (vals.size > 8) "\n  … (+${vals.size - 8} more)" else ""
+        }
+        if (findings.isEmpty()) return "No obvious secrets found in strings/ and res/."
+        return findings.entries.joinToString("\n\n") { (kind, vals) ->
+            kind + ":\n" + vals.take(12).joinToString("\n") { "  • $it" }
         }
     }
 
-    /** Bundled Frida hook scripts, keyed by friendly name. */
-    val FRIDA_SCRIPTS: Map<String, String> = mapOf(
-        "ssl_pin_bypass.js" to """/*
- * Standard Frida SSL-pinning bypass: replaces the default X509TrustManager so any
- * certificate chain is accepted, and neutralizes common Pinning TrustManager hooks.
- */
+    /** Human-readable weakness checklist built from the manifest and badging output. */
+    private fun vulnChecklist(badging: String, manifestRaw: String): String {
+        val items = mutableListOf<String>()
+        fun flag(name: String, risky: Boolean, why: String) = items.add((if (risky) "⚠ " else "✓ ") + name + " — " + why)
+
+        flag("Debuggable", containsFlagTrue(manifestRaw, "debuggable"), "release builds should not set android:debuggable=true")
+        flag("allowBackup", containsFlagTrue(manifestRaw, "allowBackup"), "allowBackup=true lets adb backup extract private data")
+        flag(
+            "Cleartext traffic",
+            containsFlagTrue(manifestRaw, "usesCleartextTraffic") || !manifestRaw.contains("networkSecurityConfig"),
+            "HTTP (not HTTPS) may be permitted app-wide; prefer TLS everywhere or a strict network security config",
+        )
+        val exported = Regex("""exported['\x00=\s]{1,4}(true|1)""").findAll(manifestRaw).count()
+        flag("Exported components", exported > 0, "$exported component attribute(s) marked exported — review each as an attack surface")
+        flag(
+            "WebView JS bridge",
+            manifestRaw.contains("JavascriptInterface"),
+            "addJavascriptInterface exposes native methods to web content — check it only loads trusted pages",
+        )
+        val perms = Regex("""uses-permission:'([^']*)'""").findAll(badging).map { it.groupValues[1] }.toSet()
+        val risky = listOf(
+            "READ_SMS", "SEND_SMS", "RECEIVE_SMS", "READ_CONTACTS", "WRITE_CONTACTS",
+            "ACCESS_FINE_LOCATION", "CAMERA", "RECORD_AUDIO", "MANAGE_EXTERNAL_STORAGE", "SYSTEM_ALERT_WINDOW",
+        ).filter { p -> perms.any { it.endsWith(p) } }
+        if (risky.isNotEmpty()) items.add("⚠ Powerful permissions granted: " + risky.joinToString(", "))
+        return items.joinToString("\n")
+    }
+
+    /** Very small heuristic for binary-XML attribute presence followed by a true-ish value. */
+    private fun containsFlagTrue(manifestRaw: String, attr: String): Boolean {
+        val idx = manifestRaw.indexOf(attr)
+        if (idx < 0) return false
+        val tail = manifestRaw.substring(idx, minOf(manifestRaw.length, idx + attr.length + 40))
+        return Regex("(true)|(\\x00true)|(=true)").containsMatchIn(tail)
+    }
+
+    /** Signs the staged APK with uber-apk-signer; copies the signed APK to the app cache. */
+    fun patchAndSign(ctx: Context, apkPath: String, log: (String) -> Unit): File? {
+        if (!signerJar(ctx).exists()) { log("uber-apk-signer isn't installed — run the setup stage first."); return null }
+        val linuxApk = stageApk(ctx, apkPath)
+        if (linuxApk == null) { log("Couldn't stage the APK."); return null }
+        runCatching { signerJar(ctx).copyTo(File(exposedDir(ctx), signerJar(ctx).name), overwrite = true) }
+        log("Signing with uber-apk-signer…")
+        val r = runLinux(ctx, "java -jar /root/.arin-hacktools/${signerJar(ctx).name} --apks $linuxApk --overwrite", timeoutMs = 10 * 60_000L, log = log)
+        val built = File(Linux.rootfs(ctx), "root/files/hack-target.apk")
+        if (r == null || !built.exists()) { log("Signing failed."); return null }
+        val dest = File(File(ctx.cacheDir, "patched").apply { mkdirs() }, "patched-signed.apk")
+        built.inputStream().use { input -> dest.outputStream().use { input.copyTo(it, 1 shl 16) } }
+        log("Signed APK ready: ${dest.name} (${dest.length() / 1024} KB)")
+        return dest
+    }
+
+    /** The four bundled Frida hooks, by filename. */
+    val FRIDA_SCRIPTS: Map<String, String> = linkedMapOf(
+        "ssl_pin_bypass.js" to """// Standard Frida SSL unpinning: trust-all SSLContext + TrustManager, plus OkHttp hostname checks.
 Java.perform(function () {
     var X509TrustManager = Java.use('javax.net.ssl.X509TrustManager');
-    var HostnameVerifier = Java.use('javax.net.ssl.HostnameVerifier');
-
-    var TrustManager = Java.registerClass({
-        name: 'com.hook.NSTrustManager',
+    var TrustAll = Java.registerClass({
+        name: 'org.arin.TrustAll',
         implements: [X509TrustManager],
         methods: {
-            checkClientTrusted: function (chain, authType) { },
-            checkServerTrusted: function (chain, authType) { },
+            checkClientTrusted: function (chain, authType) {},
+            checkServerTrusted: function (chain, authType) {},
             getAcceptedIssuers: function () { return []; }
         }
     });
-
-    var Context = Java.use('android.app.ActivityThread');
-    Context.currentApplication().getApplicationContext();
+    var trustAll = [TrustAll.$new()];
     var SSLContext = Java.use('javax.net.ssl.SSLContext');
-    var init = SSLContext.init.overload('[Ljavax.net.ssl.KeyManager;', '[Ljavax.net.ssl.TrustManager;', 'java.security.SecureRandom');
-    init.implementation = function (km, tm, sr) {
-        console.log('[+] SSLContext.init patched — trust manager replaced');
-        init.call(this, km, [TrustManager.$new()], sr);
-    };
-
-    var HP = Java.use('okhttp3.OkHttpClient$Builder').hostnameVerifier;
-    if (HP) {
-        HP.implementation = function (hv) {
-            console.log('[+] OkHttp hostname verifier patched');
-            return HVStub.$new();
+    SSLContext.init.overload('[Ljavax.net.ssl.KeyManager;', '[Ljavax.net.ssl.TrustManager;', '[Ljava.security.SecureRandom;')
+        .implementation = function (km, tm, sr) {
+            console.log('[*] Swapping TrustManagers for trust-all');
+            this.init(km, trustAll, sr);
         };
-    }
+    try {
+        var OkHostnameVerifier = Java.use('okhttp3.internal.tls.OkHostnameVerifier');
+        OkHostnameVerifier.verify.overload('java.lang.String', 'javax.net.ssl.SSLSession').implementation = function () { return true; };
+        OkHostnameVerifier.verify.overload('java.lang.String', 'java.security.cert.X509Certificate').implementation = function () { return true; };
+    } catch (e) {}
+    try {
+        var HostnameVerifier = Java.use('javax.net.ssl.HostnameVerifier');
+        Java.registerClass({
+            name: 'org.arin.TrustHosts',
+            implements: [HostnameVerifier],
+            methods: { verify: function (h, s) { return true; } }
+        });
+    } catch (e) {}
+    console.log('[*] SSL pinning bypass active');
 });
 """,
-        "root_bypass.js" to """/*
- * Root-detection bypass: hides su/busybox binaries, strips the standard root apps from
- * getPackages and makes Runtime.exec / File.exists claims about root paths harmless.
- */
+        "root_bypass.js" to """// Hides root indicators: su/busybox files, shell-outs to su, and test-keys build tags.
 Java.perform(function () {
-    var F = Java.use('java.io.File');
-    var roots = ['/system/bin/su', '/system/xbin/su', '/sbin/su', '/system/sd/xbin/su',
-                 '/vendor/bin/su', '/su/bin/su', '/data/local/xbin/su', '/data/local/bin/su',
-                 '/system/bin/busybox', '/system/xbin/busybox'];
-    F.exists.implementation = function () {
+    var File = Java.use('java.io.File');
+    File.exists.implementation = function () {
         var p = this.getAbsolutePath();
-        for (var i = 0; i < roots.length; i++) if (p === roots[i]) return false;
+        if (p.indexOf('su') !== -1 || p.indexOf('busybox') !== -1 || p.indexOf('Superuser') !== -1 || p.indexOf('magisk') !== -1) return false;
         return this.exists();
     };
-
-    var R = Java.use('java.lang.Runtime');
-    R.exec.overload('java.lang.String').implementation = function (cmd) {
-        if (cmd.indexOf('su') === 0 || cmd.indexOf('which') !== -1) {
-            console.log('[+] hid exec: ' + cmd);
-            return R.exec.call(this, 'echo ');
+    var Runtime = Java.use('java.lang.Runtime');
+    Runtime.exec.overload('java.lang.String').implementation = function (cmd) {
+        if (cmd === 'su' || cmd.indexOf('su ') !== -1 || cmd.indexOf('which') !== -1) {
+            console.log('[*] Blocked exec: ' + cmd);
+            throw Java.use('java.io.IOException').$new('blocked by root_bypass');
         }
-        return R.exec.call(this, cmd);
+        return this.exec(cmd);
     };
-
-    try {
-        var PM = Java.use('android.app.ApplicationPackageManager');
-        PM.getPackageInfo.overload('java.lang.String', 'int').implementation = function (name, flags) {
-            if (['com.topjohnwu.magisk', 'eu.chainfire.supersu', 'com.noshufou.android.su',
-                 'com.koushikdutta.superuser'].indexOf(name) !== -1) {
-                throw Java.use('android.content.pm.PackageManager$NameNotFoundException').$new(name);
-            }
-            return this.getPackageInfo(name, flags);
-        };
-    } catch (e) { console.log('[-] package hook skipped: ' + e); }
-
-    try {
-        var BS = Java.use('android.os.Build');
-        var TAGS = Java.use('java.lang.String').$new(BS.TAGS.value);
-        if (TAGS.toString().indexOf('test-keys') !== -1) {
-            BS.TAGS.value = Java.use('java.lang.String').$new(TAGS.toString().replace('test-keys', 'release-keys'));
-            console.log('[+] Build.TAGS patched (test-keys hidden)');
-        }
-    } catch (e) { }
-    console.log('[+] Root detection bypass armed');
+    var Build = Java.use('android.os.Build');
+    var tags = Build.TAGS.value;
+    if (tags && tags.indexOf('test-keys') !== -1) { Build.TAGS.value = 'release-keys'; console.log('[*] TAGS -> release-keys'); }
+    console.log('[*] Root hiding active');
 });
 """,
-        "license_bypass.js" to """/*
- * License-check bypass: stubs the common LicenseChecker.isLic... pattern to always return
- * true, plus a generic "is*" boolean patch for obfuscated packages when configured.
- */
+        "license_bypass.js" to """// Stubs licence checks to licensed: Google Play Licensing's LicenseChecker and any .isLicensed method found.
 Java.perform(function () {
-    // Known public licensing APIs first.
     try {
+        var Policy = Java.use('com.google.android.vending.licensing.Policy');
+        var licensed = Policy.LICENSED.value;
         var LC = Java.use('com.google.android.vending.licensing.LicenseChecker');
-        LC.checkAccess.implementation = function (cb) {
-            console.log('[+] Google Licensing checkAccess stubbed');
-            try {
-                var Policy = cb.getClass().getMethod('allow').invoke(cb);
-            } catch (e) { }
-            return;
+        LC.checkAccess.overload('com.google.android.vending.licensing.LicenseCheckerCallback').implementation = function (cb) {
+            console.log('[*] LicenseChecker.checkAccess -> LICENSED (' + licensed + ')');
+            cb.allow(licensed);
         };
-    } catch (e) { }
-
-    // Generic probe: every class whose name contains LicenseChecker/isLicensed-style members.
-    Java.enumerateLoadedClasses({
-        onMatch: function (name) {
-            if (name.indexOf('License') === -1 && name.toLowerCase().indexOf('licence') === -1) return;
-            try {
-                var cls = Java.use(name);
-                var methods = cls.class.getDeclaredMethods();
-                for (var i = 0; i < methods.length; i++) {
-                    var m = methods[i];
-                    var mn = m.getName();
-                    var rt = m.getReturnType().getName();
-                    if (/licensed|valid|activated|premium|registered|ok$/i.test(mn) && rt === 'boolean') {
-                        var ov = cls[mn];
-                        for (var j = 0; j < ov.overloads.length; j++) {
-                            ov.overloads[j].implementation = function () {
-                                console.log('[+] ' + mn + ' forced to TRUE in ' + name);
-                                return true;
-                            };
-                        }
-                    }
-                }
-            } catch (err) { }
-        },
-        onComplete: function () { console.log('[+] License stubbing complete'); }
-    });
-});
-""",
-        "mem_dump.js" to """/*
- * Memory dump: walks the heaps of the target process and prints printable ASCII strings
- * of length >= 6 that appear in readable allocations (tokens, urls, keys, traces...).
- */
-console.log('[+] Starting heap string scan…');
-function printable(bytes, minLen) {
-    var s = '', ch;
-    for (var i = 0; i < bytes.length && s.length < 400; i++) {
-        ch = bytes[i];
-        if (ch >= 32 && ch < 127) s += String.fromCharCode(ch);
-        else if (s.length >= minLen) break;
-        else s = '';
-    }
-    return s.length >= minLen ? s : '';
-}
-Java.perform(function () {
+    } catch (e) {}
     var seen = {};
-    Java.choose('java.lang.String', {
-        onMatch: function (inst) {
-            var v = inst.toString();
-            if (v.length < 6 || v.length > 512) return;
-            if (seen[v]) return; seen[v] = true;
-            console.log('[str] ' + v);
-        },
-        onComplete: function () { console.log('[+] Java heap string scan done'); }
-    });
-    console.log('[+] Native heap walk:');
-    Process.enumerateRanges({ protection: 'r--', coalesce: false }).slice(0, 200).forEach(function (range) {
+    function stub(name) {
+        if (seen[name]) return;
+        seen[name] = true;
         try {
-            var d = Memory.readByteArray(range.base, Math.min(range.size, 65536));
-            var u8 = new Uint8Array(d);
-            var s = printable(u8, 6);
-            if (s) console.log('[mem @' + range.base + '] ' + s.substring(0, 400));
-        } catch (e) { }
+            var C = Java.use(name);
+            if (C.isLicensed) {
+                C.isLicensed.implementation = function () {
+                    console.log('[*] ' + name + '.isLicensed -> true');
+                    return true;
+                };
+            }
+        } catch (e) {}
+    }
+    ['LicenseChecker', 'LicenseValidator', 'com.google.android.vending.licensing.LicenseChecker'].forEach(stub);
+    Java.enumerateLoadedClasses({
+        onMatch: function (name) { if (name.indexOf('License') !== -1) stub(name); },
+        onComplete: function () { console.log('[*] Licence checks stubbed to licensed (' + Object.keys(seen).length + ' classes)'); }
     });
 });
 """,
+        "mem_dump.js" to """// Dumps readable heap strings (tokens, credentials and keys often linger here).
+Java.perform(function () {
+    var out = [];
+    Java.choose('java.lang.String', {
+        onMatch: function (s) {
+            try {
+                var v = s.toString();
+                if (v.length >= 6 && v.length <= 200 && /[A-Za-z0-9+/=_-]{8,}/.test(v)) out.push(v);
+            } catch (e) {}
+        },
+        onComplete: function () {
+            console.log('[*] Dumping ' + out.length + ' candidate strings (first 500):');
+            out.slice(0, 500).forEach(function (s) { console.log(s); });
+        }
+    });
+});
+""",
+    )
+
+    private val SECRET_PATTERNS: Map<String, Pattern> = linkedMapOf(
+        "AWS access key" to Pattern.compile("AKIA[0-9A-Z]{16}"),
+        "Google API key" to Pattern.compile("AIza[0-9A-Za-z_-]{35}"),
+        "Firebase URL" to Pattern.compile("https://[a-zA-Z0-9_-]+(\\.[-a-zA-Z0-9_]+)*\\.firebaseio\\.com"),
+        "JWT" to Pattern.compile("eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}"),
+        "Generic token/key" to Pattern.compile("(?i)(api[_-]?key|secret|token)[\"'\\s:=]{1,4}[A-Za-z0-9+/=_-]{16,}"),
+        "Private key block" to Pattern.compile("-----BEGIN[ A-Z]*PRIVATE KEY-----"),
     )
 }
