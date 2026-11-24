@@ -15,8 +15,8 @@ android {
         // 28, like Termux: Android blocks running programs from app storage for apps targeting 29+,
         // and the built-in Linux (PRoot) needs that. Arin is installed from GitHub, not the Play Store.
         targetSdk = 28
-        versionCode = 20
-        versionName = "0.15.0"
+        versionCode = 21
+        versionName = "0.15.1"
     }
 
     signingConfigs {
@@ -80,4 +80,6 @@ dependencies {
     implementation("com.tom-roush:pdfbox-android:2.0.27.0")
     // Unpacks the Ubuntu image for the built-in Linux.
     implementation("org.apache.commons:commons-compress:1.27.1")
+    // Security Lab: plain checks for targets and open ports.
+    testImplementation("junit:junit:4.13.2")
 }
