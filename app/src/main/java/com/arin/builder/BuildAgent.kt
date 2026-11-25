@@ -119,6 +119,8 @@ class BuildAgent(
     private var uploadedOnce = false
     private var currentSha: String? = req.project?.lastSha
     private var currentRound = 0
+    /** The versionCode this self-update sets (and which the published APK must really have). */
+    private var expectedSelfVersion = 0
 
     private val files = linkedMapOf<String, String>().apply { req.project?.files?.let { putAll(it) } }
     private val deps = linkedSetOf<String>().apply { req.project?.deps?.let { addAll(it) } }
@@ -279,6 +281,8 @@ class BuildAgent(
             files.putAll(gh.readTextFiles(repo))
             onProgress(null, "")
             if (files.isEmpty()) return BuildResult(false, "Couldn't read Arin's source from ${req.selfRepo}@${repo.branch}. Check the repository in Settings → GitHub.")
+            // The version number must always go up: Android refuses an APK with a lower versionCode ("App not installed").
+            pinSelfVersionCode()
             step(BuildEvent.Kind.DONE, "Read ${files.size} source files")
             step(BuildEvent.Kind.THINKING, "Working out the changes to Arin with ${req.provider.label}")
             val assets = addAttachedAssets()
@@ -490,6 +494,21 @@ class BuildAgent(
                 if (apk == null || size == null) {
                     return BuildResult(false, "The build worked, but GitHub hasn't published the APK yet. Open the repo's Releases on GitHub in a minute.", repo.url)
                 }
+                // Arin updating itself must really install over the installed Arin: check version number and signing key first.
+                if (self) {
+                    val problem = verifySelfUpdate(apk)
+                    if (problem != null) {
+                        saveProject(repo, apk)
+                        return BuildResult(
+                            false,
+                            "This self-update must not be installed: $problem",
+                            repo.url,
+                            apk,
+                            log = problem,
+                            runUrl = run.url,
+                        )
+                    }
+                }
                 step(BuildEvent.Kind.DONE, "APK ready: ${mb(size)}")
                 saveProject(repo, apk)
                 // The emulator test (it ran in the same GitHub job, after the APK was published).
@@ -581,6 +600,48 @@ class BuildAgent(
     }
 
     private fun mb(bytes: Long) = if (bytes < 1024 * 1024) "${bytes / 1024} KB" else "%.1f MB".format(bytes / 1048576.0)
+
+    /**
+     * Sets Arin's own versionCode for this self-update: at least the floor (1000) and always one above the installed
+     * app, so the number can never run backwards. Everything else in the build file is left alone.
+     */
+    private fun pinSelfVersionCode() {
+        val ctx = context ?: return
+        val installed = SelfUpdate.installedVersionCode(ctx)
+        val target = maxOf(SelfUpdate.MIN_VERSION_CODE, installed + 1)
+        expectedSelfVersion = target
+        val path = "app/build.gradle.kts"
+        val raw = files[path]
+        if (raw == null) {
+            step(BuildEvent.Kind.ERROR, "Arin's app/build.gradle.kts wasn't read, so the new version number can't be checked before publishing")
+            return
+        }
+        val versionLine = Regex("""(?m)^([ \t]*versionCode[ \t]*=[ \t]*)(\d+)""")
+        if (!versionLine.containsMatchIn(raw)) {
+            step(BuildEvent.Kind.ERROR, "No versionCode line found in Arin's app/build.gradle.kts; the update would keep the old number")
+            return
+        }
+        val updated = versionLine.replace(raw) { it.groupValues[1] + target }
+        if (updated == raw) return
+        files[path] = updated
+        pendingFiles[path] = updated.toByteArray()
+        step(
+            BuildEvent.Kind.STEP,
+            "Version number set to $target (installed: ${if (installed > 0) installed else "unknown"}; floor ${SelfUpdate.MIN_VERSION_CODE})",
+        )
+    }
+
+    /** Downloads the published update and checks its version number and signer; returns the problem, or null when it installs. */
+    private suspend fun verifySelfUpdate(apkUrl: String): String? {
+        val ctx = context ?: return "the built APK couldn't be checked (no app context)."
+        step(BuildEvent.Kind.STEP, "Checking the update installs over the installed Arin (version number and signing key)")
+        val local = SelfUpdate.download(ctx, apkUrl) ?: return "the new APK couldn't be downloaded to check it."
+        val check = SelfUpdate.verify(ctx, local, expectedSelfVersion)
+        runCatching { local.delete() }
+        check.log.lines().filter { it.isNotBlank() }.forEach { step(BuildEvent.Kind.STEP, it) }
+        step(if (check.ok) BuildEvent.Kind.DONE else BuildEvent.Kind.ERROR, check.message)
+        return if (check.ok) null else check.message
+    }
 
     private fun saveProject(repo: GitHubClient.Repo, apk: String?) {
         onProject(
@@ -726,525 +787,3 @@ class BuildAgent(
         === ABOUT: what this part of the app does, in plain English ===
         === FILE: app/src/main/java/${packageName.replace('.', '/')}/MainActivity.kt ===
         (the whole file)
-        === END FILE ===
-        Keep it to a few files (one MainActivity.kt with all the screens is fine) so the whole answer fits.
-    """.trimIndent()
-
-    private fun firstPrompt() = buildString {
-        appendLine("Build this Android app. Implement EVERY point below in full: every feature, screen, option and detail that was")
-        appendLine("asked for or agreed. Nothing may be left out, simplified away, faked with sample data, or left as a TODO or placeholder.")
-        appendLine()
-        appendLine("=== REQUIREMENTS ===")
-        appendLine(requirements)
-        appendLine("=== END REQUIREMENTS ===")
-        appendLine()
-        appendLine("App name: $appName")
-        appendLine()
-        appendLine("Plan first, before writing any file: for each feature, research online the best current way to build it (the ")
-        appendLine("right Android API, library or GitHub project and its newest stable version, and known pitfalls) with <search> / ")
-        appendLine("<fetch>, so the app builds and works with zero errors the first time.")
-        appendLine()
-        append(sizeRule)
-    }
-
-    private val sizeRule = "If the whole app doesn't fit in one reply, write as many COMPLETE files as fit (the most important first) and end " +
-        "with the line === MORE === ; you will be asked to continue. When every file is written, end with the line === DONE === ."
-
-    /** The file that was being written when a reply got cut off, if any. */
-    private fun cutOffFile(reply: String): String? {
-        if (!parse(reply).truncated) return null
-        return reply.lines().lastOrNull { fileStart.containsMatchIn(it.trim()) }?.let { fileStart.find(it.trim())?.groupValues?.get(1)?.trim('`', ' ') }
-    }
-
-    /** Big apps don't fit in one reply: keep asking for the rest until the model says it's done. */
-    private suspend fun finishWriting(notesIn: List<String>): List<String> {
-        var notes = notesIn
-        var rounds = 0
-        val maxRounds = if (req.effort == Effort.LOW) 2 else 8
-        while (rounds < maxRounds && (moreLine.containsMatchIn(lastReply) || parse(lastReply).truncated)) {
-            rounds++
-            val cut = cutOffFile(lastReply)
-            step(BuildEvent.Kind.STEP, "It's a big app: writing the next part (${files.size} files so far)")
-            val before = files.size to pendingFiles.size
-            notes = apply(ask(buildString {
-                appendLine("You are part-way through writing this Android app.")
-                appendLine()
-                appendLine("=== REQUIREMENTS ===")
-                appendLine(requirements)
-                appendLine("=== END REQUIREMENTS ===")
-                appendLine()
-                appendLine("Files written so far (complete; don't send them again unless you change them):")
-                appendFiles()
-                if (cut != null) {
-                    appendLine()
-                    appendLine("Your last reply was cut off in the middle of $cut, so that file was NOT saved. Write it again in full (split it into smaller files if it's long).")
-                }
-                appendLine()
-                appendLine("Now write the remaining files, so that every requirement is implemented and everything that is used exists (classes, functions, screens, resources).")
-                append(sizeRule)
-            }))
-            // Nothing new came back: stop asking.
-            if (before == (files.size to pendingFiles.size) && cutOffFile(lastReply) == null) break
-        }
-        return notes
-    }
-
-    /** Checks the written app against the requirements, one by one, and has the model add whatever is missing. */
-    private suspend fun reviewAgainstRequirements(notesIn: List<String>): List<String> {
-        var notes = notesIn
-        repeat(reviewRounds) { round ->
-            step(BuildEvent.Kind.STEP, if (round == 0) "Checking that everything you asked for is in the app" else "Checking once more that nothing is missing")
-            val reply = ask(buildString {
-                appendLine("Review this Android app against its requirements before it is built.")
-                appendLine()
-                appendLine("=== REQUIREMENTS ===")
-                appendLine(requirements)
-                appendLine("=== END REQUIREMENTS ===")
-                appendLine()
-                appendLine("Current files:")
-                appendFiles()
-                appendLine()
-                appendLine("Go through the requirements one at a time and look for:")
-                appendLine("- anything asked for that is missing or only partly done;")
-                appendLine("- placeholders, TODOs, empty click handlers, buttons that do nothing, sample data where real behaviour was asked for;")
-                appendLine("- screens that can't be reached, settings that aren't saved, data that is lost when the app restarts (if it should be kept);")
-                appendLine("- code that won't compile: missing imports, classes, functions or resources, wrong API names, missing manifest permissions.")
-                appendLine()
-                appendLine("If you find anything, reply with every file to add or change, in full, in the usual format; start each with an")
-                appendLine("=== ABOUT: line saying in plain English which requirement it completes or what it fixes. $sizeRule")
-                append("If every requirement is fully implemented and the code is correct, reply with exactly: === COMPLETE ===")
-            })
-            val changedBefore = pendingFiles.size to files.hashCode()
-            if (!reply.contains("=== FILE:") && parse(reply).files.isEmpty()) {
-                step(BuildEvent.Kind.DONE, "Checked: everything you asked for is in the app")
-                return notes
-            }
-            notes = apply(reply)
-            notes = finishWriting(notes)
-            if (changedBefore == (pendingFiles.size to files.hashCode())) return notes
-        }
-        return notes
-    }
-
-    /** Files most likely to matter first: ones named in [hint] (errors or the request), then build files, then sources. */
-    private fun prioritized(hint: String): List<Map.Entry<String, String>> {
-        val h = hint.lowercase()
-        return files.entries.sortedBy { (path, _) ->
-            val name = path.substringAfterLast('/').lowercase()
-            when {
-                h.contains(path.lowercase()) || h.contains(name) -> 0
-                name.startsWith("build.gradle") || name.startsWith("settings.gradle") || name == "libs.versions.toml" -> 1
-                name == "androidmanifest.xml" || name.endsWith(".kt") || name.endsWith(".java") -> 2
-                else -> 3
-            }
-        }
-    }
-
-    private fun StringBuilder.appendFiles(hint: String = "") {
-        // Offline models have a much smaller memory for text.
-        var budget = if (self) 160_000 else 130_000
-        prioritized(hint).forEach { (path, content) ->
-            if (budget <= 0) return@forEach
-            val c = content.take(budget)
-            budget -= c.length
-            appendLine("=== FILE: $path ===")
-            appendLine(c)
-            appendLine("=== END FILE ===")
-        }
-        if (deps.isNotEmpty()) appendLine("Extra dependencies: ${deps.joinToString()}")
-    }
-
-    private fun changePrompt() = buildString {
-        if (self) {
-            appendLine("Here is the source of Arin itself: the Android AI assistant app you are running in (package com.arin, Kotlin + Jetpack Compose).")
-            appendLine("Its build setup, GitHub workflow and signing key already work: don't change .github/, the keystore, applicationId or targetSdk.")
-            appendLine("Increase versionCode by 1 and the last number of versionName in app/build.gradle.kts, and update the version shown in Settings to match.")
-            appendLine("Keep everything that works; change only what the request needs. Add new files where they fit the existing package layout.")
-        } else {
-            appendLine("Here is an existing Android app, \"$appName\" (${if (imported) "uploaded by the user" else "originally: ${req.project?.description}"}).")
-        }
-        appendLine()
-        appendLine("Current files:")
-        appendFiles(req.description)
-        appendLine()
-        if (!self && !imported && requirements.isNotBlank() && requirements != req.description) {
-            appendLine("Everything this app must do (keep all of it working, and add anything from this list that is still missing):")
-            appendLine("=== REQUIREMENTS ===")
-            appendLine(requirements)
-            appendLine("=== END REQUIREMENTS ===")
-            appendLine()
-        }
-        appendLine("Make this change: ${req.description}")
-        appendLine()
-        appendLine("Reply with every file you change or add, in full, in the same format. Files you don't send stay as they are.")
-        if (!self) appendLine(sizeRule)
-        appendLine("To delete a file, send it with the single line: DELETE")
-    }
-
-    /** The first compiler or Gradle error, cleaned up to search the web for it. */
-    private fun mainError(errors: String): String {
-        val line = errors.lines().map { it.trim() }.firstOrNull { it.startsWith("e: ") || it.contains("error:", true) || it.contains("What went wrong", true) || it.contains("Could not resolve", true) }
-            ?: errors.lines().firstOrNull { it.isNotBlank() } ?: return ""
-        return "android gradle " + line.removePrefix("e: ")
-            .replace(Regex("""file:///\S+?:\d+:\d+\s*"""), "")
-            .replace(Regex("""(/[\w.@+-]+){2,}"""), " ")
-            .replace(Regex("""\s+"""), " ").trim().take(150)
-    }
-
-    private fun fixPrompt(errors: String, notes: List<String>, web: String = "") = buildString {
-        appendLine(if (errors.startsWith("RUNTIME PROBLEM")) "The app below builds, but it CRASHES or won't run when opened on an Android emulator. " +
-            "Find the cause in the crash log (the first 'Caused by' and the app's own lines in the stack trace) and fix it. " +
-            "Typical causes: a missing permission or activity in the manifest, a null value, network on the main thread, a missing resource." else "The app below failed to build. Fix it.")
-        appendLine("What the app must do (keep every feature; never fix an error by removing what was asked for):")
-        appendLine(if (self) req.description else requirements.take(14_000))
-        appendLine()
-        appendLine("Build errors:")
-        appendLine(errors)
-        if (notes.isNotEmpty()) {
-            appendLine()
-            appendLine("Notes from the build tool:")
-            notes.forEach { appendLine("- $it") }
-        }
-        if (web.isNotBlank()) {
-            appendLine()
-            appendLine("I searched the web for the main error. Results:")
-            appendLine(web)
-            appendLine("Use what fits (you may also <search> or <fetch> for more), and try a different approach than last time.")
-        }
-        appendLine()
-        appendLine("Current files:")
-        appendFiles(errors)
-        appendLine()
-        appendLine("Reply with every file you change, in full, in the same format. Files you don't send stay as they are.")
-        appendLine("To delete a file, send it with the single line: DELETE")
-    }
-
-    /** Applies the model's output; returns notes to pass back to the model (skipped downloads etc.). */
-    private suspend fun apply(output: String): List<String> {
-        val notes = mutableListOf<String>()
-        val parsed = parse(output)
-        if (parsed.truncated) notes += "Your last reply was cut off. Send fewer or shorter files."
-        parsed.files.map { (p, c) -> normalizePath(p) to c }.forEach { (path, content) ->
-            val allowed = if (imported) !path.startsWith(".github/") && !path.endsWith(".jar") else path.startsWith("app/src/main/")
-            if (!allowed || path.contains("..") || path.startsWith("/")) {
-                notes += if (imported) "Ignored $path: .github/ and the wrapper jar can't be changed." else "Ignored $path: only files under app/src/main/ are allowed."
-            } else if (content.trim() == "DELETE") {
-                if (files.remove(path) != null) pendingFiles[path] = null
-            } else if (files[path] != content) {
-                files[path] = content
-                pendingFiles[path] = content.toByteArray()
-            }
-        }
-        if (imported && parsed.deps.isNotEmpty()) notes += "Add libraries by editing the module's build.gradle(.kts) directly."
-        if (!imported) parsed.deps.forEach { raw ->
-            val d = raw.trim().removePrefix("ksp:").removePrefix("ksp ").removePrefix("implementation ").trim().trim('"', '(', ')')
-            // Code generators (Room's compiler) are added through KSP, with its Gradle plugin.
-            val generator = raw.trim().startsWith("ksp") || ProjectTemplate.kspArtifacts.any { d.contains(":$it") }
-            val resolved = resolveDependency(d)
-            if (resolved == null) {
-                notes += "Dependency $d was not found on Maven; use a different library."
-                return@forEach
-            }
-            val entry = if (generator) "ksp:$resolved" else resolved
-            if (entry !in deps) {
-                deps.removeAll { it.removePrefix("ksp:").substringBeforeLast(':') == resolved.substringBeforeLast(':') }
-                deps += entry
-                depsChanged = true
-                step(BuildEvent.Kind.LIBRARY, "Added library $resolved")
-            }
-            if (generator && deps.none { it.startsWith("plugin:com.google.devtools.ksp:") }) {
-                val ksp = resolveDependency("com.google.devtools.ksp:symbol-processing-gradle-plugin:latest")?.substringAfterLast(':')
-                    ?.takeIf { v -> v.none { it.isLetter() } } // a finished release, not a beta or RC
-                deps += "plugin:com.google.devtools.ksp:" + (ksp ?: ProjectTemplate.KSP)
-                depsChanged = true
-            }
-            if (resolved.startsWith("androidx.room:room-compiler:")) {
-                val runtime = "androidx.room:room-runtime:" + resolved.substringAfterLast(':')
-                if (deps.none { it.substringBeforeLast(':') == "androidx.room:room-runtime" }) {
-                    deps += runtime
-                    depsChanged = true
-                }
-            }
-        }
-        parsed.downloads.forEach { (url, path) -> download(url, path)?.let { notes += it } }
-        return notes
-    }
-
-    private suspend fun waitForRun(repo: GitHubClient.Repo, sha: String): GitHubClient.Run? {
-        var run: GitHubClient.Run? = null
-        val start = System.currentTimeMillis()
-        while (System.currentTimeMillis() - start < 35 * 60_000) {
-            run = runCatching { gh.runFor(repo, sha, workflowFile) }.getOrNull() ?: run
-            if (run == null && System.currentTimeMillis() - start > 3 * 60_000) return null
-            if (run?.status == "completed") return run
-            delay(10_000)
-        }
-        return run
-    }
-
-    // ---- Internet access: libraries and files ----
-
-    private val repos = listOf(
-        "https://dl.google.com/android/maven2",
-        "https://repo1.maven.org/maven2",
-        "https://jitpack.io",
-    )
-
-    private val safeHosts = listOf(
-        "github.com", "raw.githubusercontent.com", "githubusercontent.com", "fonts.google.com",
-        "fonts.gstatic.com", "upload.wikimedia.org", "commons.wikimedia.org", "repo1.maven.org",
-        "dl.google.com", "jitpack.io", "unpkg.com", "cdn.jsdelivr.net",
-    )
-
-    private suspend fun httpText(url: String): String? = withContext(Dispatchers.IO) {
-        runCatching {
-            Http.client.newCall(Request.Builder().url(url).build()).execute().use { r ->
-                if (r.isSuccessful) r.body?.string() else null
-            }
-        }.getOrNull()
-    }
-
-    /** Checks the library exists; replaces "latest", "+" or a missing version with the newest release. */
-    private suspend fun resolveDependency(coord: String): String? {
-        val parts = coord.trim().split(":")
-        if (parts.size < 2) return null
-        val (group, artifact) = parts
-        val version = parts.getOrNull(2)?.trim().orEmpty()
-        val path = group.replace('.', '/') + "/" + artifact
-        for (base in repos) {
-            if (version.isNotEmpty() && version != "latest" && !version.contains('+')) {
-                if (httpText("$base/$path/$version/$artifact-$version.pom") != null) return "$group:$artifact:$version"
-            }
-            val meta = httpText("$base/$path/maven-metadata.xml") ?: continue
-            val latest = Regex("<release>([^<]+)</release>").find(meta)?.groupValues?.get(1)
-                ?: Regex("<latest>([^<]+)</latest>").find(meta)?.groupValues?.get(1)
-                ?: Regex("<version>([^<]+)</version>").findAll(meta).lastOrNull()?.groupValues?.get(1)
-            if (latest != null) return "$group:$artifact:$latest"
-        }
-        return null
-    }
-
-    private val resourceName = Regex("^[a-z][a-z0-9_]*(\\.[a-z0-9]+)?$")
-
-    /** Downloads a file into the project; returns a note for the model if it was skipped. */
-    private suspend fun download(url: String, path: String): String? {
-        val okPath = path.startsWith("app/src/main/res/raw/") || path.startsWith("app/src/main/res/drawable/") ||
-            path.startsWith("app/src/main/res/font/") || path.startsWith("app/src/main/assets/")
-        if (!okPath || path.contains("..")) return "Skipped download to $path: use res/raw, res/drawable, res/font or assets."
-        if (!path.startsWith("app/src/main/assets/") && !resourceName.matches(path.substringAfterLast('/'))) {
-            return "Skipped $path: resource names must be lowercase letters, digits and underscores."
-        }
-        val host = runCatching { URI(url).host?.lowercase() }.getOrNull()
-        if (host == null || !url.startsWith("https://")) return "Skipped $url: only https links work."
-        val safe = safeHosts.any { host == it || host.endsWith(".$it") }
-        if (!safe && !req.allowOtherSites) {
-            step(BuildEvent.Kind.DOWNLOAD, "Blocked download from $host (turn on \"Allow other sites\")")
-            return "Download from $host was blocked. Use a file from GitHub, Google Fonts or Wikimedia, or draw it in code."
-        }
-        step(BuildEvent.Kind.DOWNLOAD, "Downloading ${path.substringAfterLast('/')} from $host")
-        val bytes = withContext(Dispatchers.IO) {
-            runCatching {
-                Http.client.newCall(Request.Builder().url(url).build()).execute().use { r ->
-                    if (!r.isSuccessful) return@use null
-                    val len = r.body?.contentLength() ?: -1
-                    if (len > MAX_DOWNLOAD) return@use null
-                    r.body?.bytes()?.takeIf { it.size <= MAX_DOWNLOAD }
-                }
-            }.getOrNull()
-        } ?: return "Download failed or was too large (max 15 MB): $url"
-        pendingFiles[path] = bytes
-        return null
-    }
-
-    /**
-     * Puts files the model named loosely where they belong in a new app: "MainActivity.kt" or
-     * "com/x/Foo.kt" go to the source folder, "src/main/…" gets "app/", "res/…" and the manifest go under app/src/main.
-     */
-    private fun normalizePath(raw: String): String {
-        val p = raw.trim().trim('`', '*', '"', '\'', ' ').removePrefix("./").removePrefix("/")
-        if (imported || p.startsWith("app/src/main/")) return p
-        val src = "app/src/main/java/${packageName.replace('.', '/')}"
-        return when {
-            p.startsWith("src/main/") -> "app/$p"
-            p.startsWith("main/") -> "app/src/$p"
-            p == "AndroidManifest.xml" || p.endsWith("/AndroidManifest.xml") -> "app/src/main/AndroidManifest.xml"
-            p.startsWith("res/") -> "app/src/main/$p"
-            p.startsWith("java/") || p.startsWith("kotlin/") -> "app/src/main/java/" + p.substringAfter('/')
-            p.endsWith(".kt") || p.endsWith(".java") -> {
-                // Keep sub-packages under the app's package, e.g. "ui/Theme.kt" or "com/x/app/ui/Theme.kt".
-                val inPkg = p.substringAfter(packageName.replace('.', '/') + "/", p)
-                if ('/' in inPkg && !inPkg.startsWith("app/")) "$src/$inPkg" else "$src/${p.substringAfterLast('/')}"
-            }
-            else -> p
-        }
-    }
-
-    // ---- Output parsing ----
-
-    data class Parsed(
-        val files: List<Pair<String, String>>,
-        val deps: List<String>,
-        val downloads: List<Pair<String, String>>,
-        val truncated: Boolean,
-    )
-
-    companion object {
-        private const val MAX_DOWNLOAD = 15L * 1024 * 1024
-
-        /** Arin's own workflow and the tag prefix of the releases it publishes. */
-        const val SELF_WORKFLOW = "build-apk.yml"
-        const val SELF_TAG_PREFIX = "arin-"
-        /** Owner name used for projects that live only on the phone (no GitHub). */
-        const val LOCAL_OWNER = "phone"
-        private const val MAX_WEB_STEPS = 6
-        private val fileStart = Regex("^=+\\s*FILE:\\s*(.+?)\\s*=*\\s*$")
-        private val fileEnd = Regex("^=+\\s*END FILE\\s*=*\\s*$")
-        private val moreLine = Regex("(?m)^=+\\s*MORE\\s*=+\\s*$")
-        private val aboutLine = Regex("^=+\\s*ABOUT:\\s*(.+?)\\s*=*\\s*$")
-
-        private val codeish = Regex("""[{};=<>()\[\]]|\b(fun|val|var|import|class|return|@Composable)\b""")
-
-        /** The model's thinking without the code in it, so progress reads as plain English. */
-        fun proseOnly(text: String): String {
-            val lines = text.lines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("```") }
-            val prose = lines.filter { l -> codeish.findAll(l).count() * 12 < l.length.coerceAtLeast(1) && l.count { it.isLetter() } > l.length / 2 }
-            return prose.joinToString(" ").ifBlank { "working out the code" }
-        }
-
-        /** The main build error, said simply. */
-        fun plainError(errors: String): String {
-            val e = errors.lines().firstOrNull { it.startsWith("e: ") || it.contains("error:", true) } ?: errors.lines().firstOrNull { it.isNotBlank() }.orEmpty()
-            val where = Regex("""([A-Za-z0-9_]+\.(kt|java|xml))""").find(e)?.groupValues?.get(1)?.let { " in $it" } ?: ""
-            val name = Regex("""Unresolved reference:?\s*'?([A-Za-z0-9_]+)""").find(e)?.groupValues?.get(1)
-            return when {
-                name != null -> "the code uses \"$name\"$where, which doesn't exist or isn't imported"
-                e.contains("Type mismatch", true) || e.contains("Argument type mismatch", true) -> "a value has the wrong type$where"
-                e.contains("No value passed for parameter", true) -> "something is called without all the information it needs$where"
-                e.contains("Could not resolve", true) || e.contains("Could not find", true) -> "a library couldn't be downloaded (wrong name or version)"
-                e.contains("@Composable", true) -> "screen code is called from a place that can't draw screens$where"
-                e.contains("resource", true) || e.contains("AAPT", true) -> "a picture, color, text or other resource is missing or broken$where"
-                e.contains("Manifest merger", true) -> "the app's Android settings (manifest) conflict"
-                e.contains("Expecting", true) || e.contains("Syntax", true) -> "the code has a typing mistake (like a missing bracket)$where"
-                e.contains("Overload resolution ambiguity", true) || e.contains("Conflicting", true) -> "two things have the same name$where"
-                e.contains("OutOfMemory", true) || e.contains("heap space", true) -> "the build ran out of memory"
-                else -> "a problem$where"
-            }
-        }
-
-        /** A plain-English guess at what a file is for, when the model didn't say. */
-        fun plainEnglish(path: String): String {
-            val file = path.substringAfterLast('/')
-            val name = file.substringBeforeLast('.')
-            val words = name.replace(Regex("([a-z])([A-Z])"), "$1 $2").replace('_', ' ').lowercase()
-            return when {
-                file == "MainActivity.kt" || file == "MainActivity.java" -> "The app's starting point: opens the first screen when you tap the icon"
-                file == "AndroidManifest.xml" -> "The app's settings for Android: its name, icon, screens and permissions"
-                file.startsWith("build.gradle") || file.startsWith("settings.gradle") || file == "libs.versions.toml" -> "The build setup: which tools and ready-made libraries the app uses"
-                file == "strings.xml" -> "The words and labels shown in the app"
-                file == "colors.xml" || file == "themes.xml" || name in setOf("Color", "Theme", "Type") -> "The app's look: colors, fonts and style"
-                name.endsWith("Screen") -> "The ${words.removeSuffix(" screen")} screen: what you see and tap there"
-                name.endsWith("ViewModel") -> "The brain behind the ${words.removeSuffix(" view model")} screen: keeps its data and reacts to your taps"
-                name.endsWith("Dao") || name.endsWith("Database") || name.endsWith("Repository") || name.endsWith("Store") -> "Saving and loading the app's data on the phone"
-                name.endsWith("Api") || name.endsWith("Client") || name.endsWith("Service") -> "Talking to the internet or running work in the background (${words})"
-                path.contains("/model/") || path.contains("/data/") -> "The kind of information the app keeps: $words"
-                path.contains("/res/drawable") || path.contains("/res/mipmap") -> "A picture or icon used in the app"
-                path.contains("/res/raw") || path.contains("/assets/") -> "A media or data file the app uses ($file)"
-                file.endsWith(".kt") || file.endsWith(".java") -> "Code for the $words part of the app"
-                else -> "Supporting file: $file"
-            }
-        }
-        private val depLine = Regex("^=+\\s*DEPENDENCY:\\s*(.+?)\\s*=*\\s*$")
-        private val downloadLine = Regex("^=+\\s*DOWNLOAD:\\s*(\\S+)\\s*->\\s*(\\S+?)\\s*=*\\s*$")
-
-        fun parse(text: String): Parsed {
-            val files = mutableListOf<Pair<String, String>>()
-            val deps = mutableListOf<String>()
-            val downloads = mutableListOf<Pair<String, String>>()
-            var path: String? = null
-            val body = StringBuilder()
-            for (raw in text.lines()) {
-                val line = raw.trim()
-                val current = path
-                if (current == null) {
-                    val start = fileStart.find(line)
-                    val dep = depLine.find(line)
-                    val dl = downloadLine.find(line)
-                    when {
-                        start != null -> {
-                            path = start.groupValues[1].trim('`', ' ')
-                            body.clear()
-                        }
-                        dep != null -> deps.add(dep.groupValues[1].trim('`', ' '))
-                        dl != null -> downloads.add(dl.groupValues[1] to dl.groupValues[2])
-                    }
-                } else if (fileEnd.matches(line)) {
-                    files.add(current to stripFences(body.toString()))
-                    path = null
-                } else {
-                    body.appendLine(raw)
-                }
-            }
-            if (files.isEmpty()) {
-                // No "=== FILE:" blocks: many models write Markdown instead. Read those, so nothing is lost.
-                val md = parseMarkdown(text)
-                if (md.isNotEmpty()) return Parsed(md, deps, downloads, truncated = false)
-            }
-            return Parsed(files, deps, downloads, truncated = path != null)
-        }
-
-        private val fence = Regex("^\\s*(`{3,}|~{3,})\\s*([A-Za-z0-9_+#.-]*)\\s*(.*)$")
-        private val pathLike = Regex("""([A-Za-z0-9_./-]+\.(?:kt|kts|java|xml|gradle|json|txt|properties|toml|pro|md|html|css|js))\b""")
-
-        /**
-         * Files written as Markdown code blocks, with the file's path in a heading, bold text, "File:" line or
-         * backticks just above the block, in the opening fence (```kotlin title="path" or ```kotlin:path), or as a
-         * comment on the block's first line (// path, <!-- path -->, # path).
-         */
-        fun parseMarkdown(text: String): List<Pair<String, String>> {
-            val lines = text.lines()
-            val out = linkedMapOf<String, String>()
-            var i = 0
-            while (i < lines.size) {
-                val open = fence.find(lines[i])
-                if (open == null) { i++; continue }
-                val marker = open.groupValues[1]
-                // Collect the block.
-                var j = i + 1
-                val body = mutableListOf<String>()
-                while (j < lines.size && !lines[j].trim().startsWith(marker.take(3))) { body += lines[j]; j++ }
-                // Where's the path? Opening fence, then the 3 lines above, then the first line of the block.
-                var path = pathLike.find(open.groupValues[3])?.groupValues?.get(1)
-                    ?: pathLike.find(open.groupValues[2].substringAfter(':', ""))?.groupValues?.get(1)
-                if (path == null) {
-                    for (k in (i - 1) downTo maxOf(0, i - 3)) {
-                        val above = lines[k].trim()
-                        if (above.isEmpty()) continue
-                        if (fence.matches(above)) break
-                        path = pathLike.findAll(above).map { it.groupValues[1] }.lastOrNull { '/' in it || '.' in it }
-                        if (path != null) break
-                    }
-                }
-                if (path == null && body.isNotEmpty()) {
-                    val first = body.first().trim()
-                    if (first.startsWith("//") || first.startsWith("<!--") || first.startsWith("#")) {
-                        path = pathLike.find(first)?.groupValues?.get(1)
-                        if (path != null) body.removeAt(0)
-                    }
-                }
-                val content = body.joinToString("\n").trimEnd()
-                if (path != null && content.isNotBlank() && !path.startsWith("http")) out[path] = content + "\n"
-                i = j + 1
-            }
-            return out.toList()
-        }
-
-        /** Small models often wrap code in ``` fences inside the file block. */
-        private fun stripFences(s: String): String {
-            val lines = s.trimEnd().lines().toMutableList()
-            while (lines.isNotEmpty() && lines.first().isBlank()) lines.removeAt(0)
-            if (lines.firstOrNull()?.trim()?.startsWith("```") == true) lines.removeAt(0)
-            if (lines.lastOrNull()?.trim() == "```") lines.removeAt(lines.lastIndex)
-            return lines.joinToString("\n") + "\n"
-        }
-    }
-}
